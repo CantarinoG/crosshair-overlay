@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Click-through crosshair overlay for Wayland compositors with layer-shell (Sway, Hyprland, KDE...).
+
+Usage:
+  crosshair [options]          show the crosshair
+  crosshair --toggle [options] show it, or close it if already running
+  crosshair --help             list all options
+"""
+import argparse
+import ctypes
+import os
+import signal
+import sys
+
+# gtk4-layer-shell must be loaded before libwayland-client, i.e. before GTK is imported.
+ctypes.CDLL("libgtk4-layer-shell.so.0")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_foreign("cairo")
+import cairo  # noqa: E402
+from gi.repository import GLib, Gtk, Gtk4LayerShell as LayerShell  # noqa: E402
+
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "crosshair.pid")
+
+
+def parse_color(s):
+    s = s.lstrip("#")
+    if len(s) == 6:
+        s += "ff"
+    if len(s) != 8:
+        raise argparse.ArgumentTypeError("color must be RRGGBB or RRGGBBAA")
+    return tuple(int(s[i:i + 2], 16) / 255 for i in (0, 2, 4, 6))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Click-through crosshair overlay.")
+    p.add_argument("--toggle", action="store_true", help="close the running crosshair if there is one, else start")
+    p.add_argument("--style", choices=["cross", "dot", "circle", "cross-dot", "t"], default="cross")
+    p.add_argument("--length", type=float, default=8, help="arm length in px (default 8)")
+    p.add_argument("--gap", type=float, default=4, help="gap from center to arms in px (default 4)")
+    p.add_argument("--thickness", type=float, default=2, help="line thickness in px (default 2)")
+    p.add_argument("--dot", type=float, default=2, help="center dot radius in px (default 2)")
+    p.add_argument("--radius", type=float, default=10, help="circle radius in px (default 10)")
+    p.add_argument("--color", type=parse_color, default=parse_color("00ff00"), help="RRGGBB[AA] (default 00ff00)")
+    p.add_argument("--outline", type=float, default=1, help="black outline width in px, 0 = none (default 1)")
+    p.add_argument("--outline-color", type=parse_color, default=parse_color("000000"))
+    p.add_argument("--offset-x", type=int, default=0, help="shift right (+) / left (-) in px")
+    p.add_argument("--offset-y", type=int, default=0, help="shift down (+) / up (-) in px")
+    p.add_argument("--output", help="monitor name, e.g. eDP-1 (default: focused monitor)")
+    return p.parse_args()
+
+
+def running_pid():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"crosshair" not in f.read():
+                return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def draw(args):
+    def path_cross(cr, c, t_shape=False):
+        g, L = args.gap, args.length
+        segs = [((c, c - g), (c, c - g - L)), ((c, c + g), (c, c + g + L)),
+                ((c - g, c), (c - g - L, c)), ((c + g, c), (c + g + L, c))]
+        if t_shape:
+            segs = segs[1:]  # no top arm
+        for (x0, y0), (x1, y1) in segs:
+            cr.move_to(x0, y0)
+            cr.line_to(x1, y1)
+
+    def render(cr, c, color, extra):
+        cr.set_source_rgba(*color)
+        cr.set_line_width(args.thickness + 2 * extra)
+        cr.set_line_cap(cairo.LINE_CAP_SQUARE if extra else cairo.LINE_CAP_BUTT)
+        if args.style in ("cross", "cross-dot", "t"):
+            path_cross(cr, c, args.style == "t")
+            cr.stroke()
+        if args.style == "circle":
+            cr.arc(c, c, args.radius, 0, 6.2832)
+            cr.stroke()
+        if args.style in ("dot", "cross-dot", "circle"):
+            cr.arc(c, c, args.dot + extra, 0, 6.2832)
+            cr.fill()
+
+    def on_draw(_area, cr, w, h):
+        cr.set_operator(cairo.OPERATOR_CLEAR)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        c = w / 2
+        if args.outline > 0:
+            render(cr, c, args.outline_color, args.outline)
+        render(cr, c, args.color, 0)
+
+    return on_draw
+
+
+def main():
+    args = parse_args()
+
+    if args.toggle:
+        pid = running_pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            return
+    elif running_pid():
+        sys.exit("crosshair already running (use --toggle to close it)")
+
+    if not LayerShell.is_supported():
+        sys.exit("layer-shell not supported: needs a wlroots/KDE/Hyprland Wayland session")
+
+    reach = max(args.gap + args.length, args.radius, args.dot) + args.thickness + args.outline + 2
+    size = int(2 * reach) | 1  # odd size -> pixel-exact center
+
+    app = Gtk.Application(application_id=None)
+
+    def on_activate(app):
+        win = Gtk.ApplicationWindow(application=app)
+        win.set_default_size(size, size)
+        win.set_decorated(False)
+        win.set_can_focus(False)
+
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "crosshair")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)  # above fullscreen windows
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_exclusive_zone(win, -1)
+        if args.output:
+            from gi.repository import Gdk
+            mons = Gdk.Display.get_default().get_monitors()
+            for i in range(mons.get_n_items()):
+                if mons.get_item(i).get_connector() == args.output:
+                    LayerShell.set_monitor(win, mons.get_item(i))
+        # No anchors -> the compositor centers the surface on the monitor.
+        css = Gtk.CssProvider()
+        css.load_from_data(b"window, window * { background: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        area = Gtk.DrawingArea()
+        area.set_content_width(size)
+        area.set_content_height(size)
+        area.set_draw_func(draw(args))
+        # Offsets: pad the opposite side so the centered surface's center moves.
+        area.set_margin_start(max(0, 2 * args.offset_x))
+        area.set_margin_end(max(0, -2 * args.offset_x))
+        area.set_margin_top(max(0, 2 * args.offset_y))
+        area.set_margin_bottom(max(0, -2 * args.offset_y))
+        win.set_child(area)
+
+        def make_click_through(_w):
+            win.get_surface().set_input_region(cairo.Region())
+
+        win.connect("realize", make_click_through)
+        win.present()
+
+    app.connect("activate", on_activate)
+
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, app.quit)
+    try:
+        app.run([])
+    finally:
+        if running_pid() in (None, os.getpid()):
+            try:
+                os.remove(PIDFILE)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
